@@ -40,7 +40,7 @@ FIREFOX_NIGHTLY_URL = (
 )
 # Build of the try push for IP-protection HTTP/3 experiments. Used by
 # `--custom-firefox`. Try push:
-# https://treeherder.mozilla.org/jobs?repo=try&revision=2c7a0fe6052b91a4311f21f40e66b79637e2169c
+# https://treeherder.mozilla.org/jobs?repo=try&revision=f8f5d6e9bc1135022c1a4045b27569d089e0d6f9
 #
 # Patch stack on top of mozilla-central, newest first:
 #   f6b3ab99ce  Bug 1978893, hold the refused connect-udp datagram instead of
@@ -98,7 +98,7 @@ FIREFOX_NIGHTLY_URL = (
 # test_happy_eyeballs_altsvc_h3_only_claim.js) did not run here.
 FIREFOX_CUSTOM_URL = (
     "https://firefox-ci-tc.services.mozilla.com/api/queue/v1/task/"
-    "Li3QyOgNTqe4ui_crwL8xg/runs/0/artifacts/public/build/target.tar.xz"
+    "Oy4_h0JiSl-g4U-jd64ulw/runs/0/artifacts/public/build/target.tar.xz"
 )
 # Origin whose h3 Alt-Svc we prime before a --vpn --h3 run (see prime_h3_altsvc).
 H3_PRIME_URL = "https://bastion.h3.speed.cloudflare.com/cdn-cgi/trace"
@@ -249,9 +249,6 @@ def build_driver(firefox: Path, geckodriver: Path,
     # default throwaway profile.
     options.add_argument("-profile")
     options.add_argument(str(PROFILE))
-    # Allow Marionette's chrome-context switch, needed to flip privileged
-    # prefs at runtime (e.g. browser.ipProtection.userEnabled).
-    options.add_argument("-remote-allow-system-access")
     # Disable Firefox's runtime-applied "recommended" WebDriver preferences.
     # Those stub real endpoints (e.g. identity.fxaccounts.auth.uri →
     # https://{server}/dummy/fxa) to isolate tests, which breaks anything
@@ -278,6 +275,9 @@ def build_driver(firefox: Path, geckodriver: Path,
     # Nightly's updater and makes Firefox exit 127 before Marionette comes up.
     service = Service(
         executable_path=str(geckodriver),
+        # Allow Marionette's chrome-context switch, needed to flip privileged
+        # prefs at runtime (e.g. browser.ipProtection.userEnabled).
+        service_args=["--allow-system-access"],
         log_output=str(CACHE / "geckodriver.log"),
         env={**os.environ, "LD_LIBRARY_PATH": ""},
     )

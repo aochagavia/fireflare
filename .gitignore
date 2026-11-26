@@ -7,3 +7,5 @@ profile-*/
 # Gecko profiler captures are huge (100s of MB each); the JSON results and
 # report.html in results/ are checked in, the .profile.json captures are not.
 results/*.profile.json
+# probe.py results: one-off experiments, not part of the report.
+results-probe/

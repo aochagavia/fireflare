@@ -83,6 +83,20 @@ How it works:
 - The self-signed certificates are accepted through WebDriver's insecure-certs mode. `network.http.http3.disable_when_third_party_roots_found` is turned off, otherwise Firefox refuses HTTP/3 to them.
 - The origin's HTTP version comes from Resource Timing's `nextHopProtocol`, since the server has no `/cdn-cgi/trace`.
 
+## Loaded-latency probe (`probe.py`)
+
+`probe.py` looks at latency under load in more detail than the speed test does. It runs one large transfer at a time against the `--bench` server (start it as above), with a zero-byte ping every ~20 ms alongside, and records each ping's send time and time to first byte. That shows *how* latency behaves during a transfer: every ping a little slower (a standing queue), or one ping that waits for the whole transfer (head-of-line blocking). A run takes ~20 s.
+
+```
+uv run probe.py 5 --firefox ../firefox/obj-x86_64-pc-linux-gnu/dist/bin/firefox --profile-dir profile-local
+uv run probe.py 5 --mode upload --bytes 50000000      # uploads instead of downloads
+uv run probe.py 2 --ping-priority high                # pings with fetch(..., {priority: 'high'})
+uv run probe.py 5 --env MOZ_LOG=timestamp,nsHttp:5 --env MOZ_LOG_FILE=/tmp/fx.log
+uv run probe.py 5 --pref network.http.http3.enable_qlog=true --env TMPDIR=/tmp/qlog
+```
+
+The argument is a `--matrix` configuration, by number or label (`5` or `5-proxy-h3masque`). It takes the same `--firefox`, `--profile-dir`, `--headless` and `--bench-*` options as `main.py`, plus `--pref` and `--env` for Firefox prefs and environment variables (e.g. logging, or switches in a local build). It prints a per-round summary (throughput, ping percentiles, the first pings and the slow ones, each as `sent at +ms: ttfb ms`), and saves the full result to `results-probe/`, which isn't checked in. With `enable_qlog`, Firefox writes qlog files for each QUIC connection under `$TMPDIR/qlog_<pid>/`.
+
 ## License
 
 Licensed under either of

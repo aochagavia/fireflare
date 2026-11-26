@@ -1,0 +1,99 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>fireflare probe</title></head>
+<body><pre id="log">probe running...</pre>
+<script type="module">
+// Loaded-latency probe (see probe.py): run one large transfer at a time and,
+// while it runs, send a ping (a zero-byte download) every CFG.interval ms.
+// Records each ping's send time and Resource Timing, so a run shows whether
+// latency under load builds up gradually (a queue) or comes as one long stall.
+//
+// CFG is filled in by probe.py: mode ('download' | 'upload'), bytes, rounds,
+// interval and delay (ms before the first ping), pingPriority ('' or a fetch()
+// priority, e.g. 'high').
+const CFG = __CFG__;
+const params = new URLSearchParams(location.search);
+const api = params.get('api');
+// `prime`: fetch the server once so Firefox stores its h3 Alt-Svc, then stop
+// (see prime_h3_altsvc in main.py).
+if (params.has('prime')) {
+  try {
+    await fetch(`${api}/__down?bytes=0&prime=${Date.now()}`);
+    window.__fireflare_primed = true;
+  } catch (e) {
+    window.__fireflare_error = 'prime: ' + String((e && e.message) || e);
+  }
+  await new Promise(() => {});  // never resolves: stop the module here
+}
+performance.setResourceTimingBufferSize(100000);
+const log = document.getElementById('log');
+const entry = (url) => performance.getEntriesByName(url).pop();
+// Times are performance.now() milliseconds. t0 is when fetch() was called;
+// rs/fb/re are the Resource Timing requestStart/responseStart/responseEnd.
+const timing = (t0, url) => {
+  const e = entry(url);
+  return { t0, rs: e?.requestStart, fb: e?.responseStart, re: e?.responseEnd,
+           proto: e?.nextHopProtocol };
+};
+
+let seq = 0;
+async function ping(tag) {
+  const url = `${api}/__down?bytes=0&p=${tag}-${seq++}`;
+  const t0 = performance.now();
+  const r = await fetch(url, CFG.pingPriority ? { priority: CFG.pingPriority } : {});
+  await r.arrayBuffer();
+  return timing(t0, url);
+}
+
+// progress: [time, bytes] samples, every >5 ms for downloads; uploads only
+// get the final one, as fetch() has no upload progress.
+async function transfer(url, progress) {
+  if (CFG.mode === 'upload') {
+    // Like @cloudflare/speedtest: one POST with the whole body as a string.
+    const r = await fetch(url, { method: 'POST', body });
+    await r.arrayBuffer();
+    progress.push([performance.now(), CFG.bytes]);
+    return;
+  }
+  const r = await fetch(url);
+  const reader = r.body.getReader();
+  let n = 0, lastT = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    n += value.length;
+    const t = performance.now();
+    if (t - lastT > 5) { progress.push([t, n]); lastT = t; }
+  }
+  progress.push([performance.now(), n]);
+}
+
+const out = { cfg: CFG, idle: [], rounds: [] };
+const body = CFG.mode === 'upload' ? '0'.repeat(CFG.bytes) : null;
+for (let i = 0; i < 20; i++) out.idle.push(await ping('idle'));
+for (let round = 0; round < CFG.rounds; round++) {
+  const url = CFG.mode === 'upload'
+    ? `${api}/__up?bytes=${CFG.bytes}&r=${round}-${Date.now()}`
+    : `${api}/__down?bytes=${CFG.bytes}&r=${round}-${Date.now()}`;
+  const progress = [];
+  const pings = [];
+  let done = false;
+  const t0 = performance.now();
+  const transferring = transfer(url, progress).then(() => { done = true; });
+  const pinging = (async () => {
+    await new Promise(r => setTimeout(r, CFG.delay));
+    while (!done) {
+      pings.push(await ping(`r${round}`));
+      await new Promise(r => setTimeout(r, CFG.interval));
+    }
+  })();
+  await transferring;
+  await pinging;
+  out.rounds.push({ ...timing(t0, url), progress, pings });
+  log.textContent = `round ${round + 1}/${CFG.rounds} done`;
+  await new Promise(r => setTimeout(r, 300));
+}
+// save_result() names the file after the origin's HTTP version.
+out.trace = { http: out.rounds[0]?.proto };
+window.__fireflare_result = out;
+log.textContent = 'done';
+</script></body></html>

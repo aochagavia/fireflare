@@ -354,24 +354,28 @@ def build_driver(firefox: Path, geckodriver: Path,
 
 class _PageHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        page = self.server.page
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(SPEEDTEST_HTML)))
+        self.send_header("Content-Length", str(len(page)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(SPEEDTEST_HTML)
+        self.wfile.write(page)
 
     def log_message(self, *_args):
         pass
 
 
-def serve_page(bench: Bench | None = None) -> tuple[ThreadingHTTPServer, str]:
+def serve_page(bench: Bench | None = None,
+               html: bytes = SPEEDTEST_HTML) -> tuple[ThreadingHTTPServer, str]:
+    """Serve `html` (by default the speed test page) on every path."""
     if bench:
         server = ThreadingHTTPServer(("127.0.0.1", bench.page_port), _PageHandler)
         host = bench.page_host
     else:
         server = ThreadingHTTPServer(("127.0.0.1", 0), _PageHandler)
         host = "127.0.0.1"
+    server.page = html
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
     return server, f"http://{host}:{port}/"
@@ -701,7 +705,8 @@ def save_result(result: dict, *, debug: bool, label: str | None = None) -> Path:
 def run_once(firefox: Path, geckodriver: Path, base_url: str, *, vpn: bool,
              h3: bool, debug: bool, disable_h3: bool = False,
              label: str | None = None, profile: bool = False,
-             headless: bool = False, bench: Bench | None = None) -> dict:
+             headless: bool = False, bench: Bench | None = None,
+             extra_prefs: dict | None = None) -> dict:
     """Run a single speed test in its own Firefox session and save the result.
     Returns the result dict (with the negotiated proxy hop + origin protocol,
     so callers can confirm what actually happened at runtime)."""
@@ -740,6 +745,8 @@ def run_once(firefox: Path, geckodriver: Path, base_url: str, *, vpn: bool,
     else:
         # Prefs persist in the profile: undo a previous --bench run.
         prefs["network.http.altsvc.enabled"] = True
+    # Caller-supplied prefs (e.g. probe.py --pref) go last, so they win.
+    prefs.update(extra_prefs or {})
     driver = build_driver(firefox, geckodriver, extra_prefs=prefs,
                           headless=headless, bench=bench)
     prof_tmp = None
@@ -845,6 +852,64 @@ def run_matrix(firefox: Path, geckodriver: Path, *, debug: bool,
         print("  " + "  |  ".join(str(c) for c in row))
 
 
+def add_browser_args(parser: argparse.ArgumentParser) -> None:
+    """Options shared by main.py and probe.py: which Firefox and profile to
+    run, how, and where the --bench server and proxy are."""
+    parser.add_argument(
+        "--profile", action="store_true",
+        help="capture a Firefox Profiler profile (Networking preset) during "
+             "each run, saved next to the result as <name>.profile.json "
+             "(load at profiler.firefox.com)",
+    )
+    parser.add_argument(
+        "--headless", action="store_true",
+        help="run Firefox without a window (for machines without a display, "
+             "e.g. a server over SSH)",
+    )
+    parser.add_argument(
+        "--firefox", type=Path, metavar="PATH",
+        help="use this Firefox binary (e.g. a local build's "
+             "obj-*/dist/bin/firefox) instead of downloading one",
+    )
+    parser.add_argument(
+        "--profile-dir", type=Path, metavar="DIR", default=PROFILE,
+        help="persistent Firefox profile to use (default: ./profile). Must be "
+             "signed in for --vpn, see the README",
+    )
+    parser.add_argument(
+        "--bench-server", default="localhost4:8443", metavar="HOST:PORT",
+        help="speed test server for --bench (default: %(default)s). The host "
+             "must resolve to the server but not be a loopback name or IP, "
+             "which IP protection never proxies",
+    )
+    parser.add_argument(
+        "--bench-proxy", default="localhost:4433", metavar="HOST:PORT",
+        help="proxy for --bench (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--bench-page-port", type=int, default=8080, metavar="PORT",
+        help="port the test page is served on for --bench (default: "
+             "%(default)s). The page goes through the proxy, so the proxy must "
+             "allow 127.0.0.1:PORT",
+    )
+
+
+def bench_from_args(args: argparse.Namespace) -> Bench:
+    return Bench(server=args.bench_server, proxy=args.bench_proxy,
+                 page_port=args.bench_page_port)
+
+
+def resolve_firefox(path: Path | None, *, custom: bool) -> Path:
+    """`path` if given (it must exist), else a downloaded build: the custom
+    one (FIREFOX_CUSTOM_URL) with `custom`, otherwise the latest Nightly."""
+    if path:
+        firefox = path.resolve()
+        if not firefox.is_file():
+            sys.exit(f"--firefox {firefox} not found")
+        return firefox
+    return ensure_firefox(FIREFOX_CUSTOM_URL if custom else FIREFOX_NIGHTLY_URL)
+
+
 def main() -> None:
     global PROFILE, RESULTS
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -874,27 +939,6 @@ def main() -> None:
              "one result per config",
     )
     parser.add_argument(
-        "--profile", action="store_true",
-        help="capture a Firefox Profiler profile (Networking preset) during "
-             "each run, saved next to the result as <name>.profile.json "
-             "(load at profiler.firefox.com)",
-    )
-    parser.add_argument(
-        "--headless", action="store_true",
-        help="run Firefox without a window (for machines without a display, "
-             "e.g. a server over SSH)",
-    )
-    parser.add_argument(
-        "--firefox", type=Path, metavar="PATH",
-        help="use this Firefox binary (e.g. a local build's "
-             "obj-*/dist/bin/firefox) instead of downloading one",
-    )
-    parser.add_argument(
-        "--profile-dir", type=Path, metavar="DIR", default=PROFILE,
-        help="persistent Firefox profile to use (default: ./profile). Must be "
-             "signed in for --vpn, see the README",
-    )
-    parser.add_argument(
         "--results-dir", type=Path, metavar="DIR",
         help="where to save result JSONs (default: ./results, or "
              "./results-bench with --bench, so the two never mix in a report)",
@@ -904,22 +948,7 @@ def main() -> None:
         help="use a self-hosted speed test server and proxy (../proxy-bench) "
              "instead of speed.cloudflare.com and the IP-protection servers",
     )
-    parser.add_argument(
-        "--bench-server", default="localhost4:8443", metavar="HOST:PORT",
-        help="speed test server for --bench (default: %(default)s). The host "
-             "must resolve to the server but not be a loopback name or IP, "
-             "which IP protection never proxies",
-    )
-    parser.add_argument(
-        "--bench-proxy", default="localhost:4433", metavar="HOST:PORT",
-        help="proxy for --bench (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--bench-page-port", type=int, default=8080, metavar="PORT",
-        help="port the test page is served on for --bench (default: "
-             "%(default)s). The page goes through the proxy, so the proxy must "
-             "allow 127.0.0.1:PORT",
-    )
+    add_browser_args(parser)
     args = parser.parse_args()
 
     require_linux_x86_64()
@@ -929,20 +958,10 @@ def main() -> None:
     RESULTS.mkdir(exist_ok=True)
     PROFILE.mkdir(exist_ok=True)
 
-    bench = None
-    if args.bench:
-        bench = Bench(server=args.bench_server, proxy=args.bench_proxy,
-                      page_port=args.bench_page_port)
-
-    if args.firefox:
-        firefox = args.firefox.resolve()
-        if not firefox.is_file():
-            sys.exit(f"--firefox {firefox} not found")
-    else:
-        # The matrix always uses the custom build (configs 4/5 need it).
-        use_custom = args.custom_firefox or args.matrix
-        firefox = ensure_firefox(
-            FIREFOX_CUSTOM_URL if use_custom else FIREFOX_NIGHTLY_URL)
+    bench = bench_from_args(args) if args.bench else None
+    # The matrix always uses the custom build (configs 4/5 need it).
+    firefox = resolve_firefox(args.firefox,
+                              custom=args.custom_firefox or args.matrix)
     geckodriver = ensure_geckodriver()
     print(f"Using {firefox_version(firefox)}")
 

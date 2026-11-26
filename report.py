@@ -140,7 +140,7 @@ def ttfb_points(r: dict, kind: str) -> list[float]:
     raw = r.get("raw") or {}
     if kind == "idle":
         timings = ((raw.get("latency") or {}).get("results") or {}).get("timings") or []
-        return [t["ttfb"] for t in timings if t.get("ttfb")]
+        return [t["ttfb"] for t in timings if t.get("ttfb") is not None]
     pts: list[float] = []
     for bucket in ((raw.get(kind) or {}).get("results") or {}).values():
         timings = bucket.get("timings") or []
@@ -148,7 +148,7 @@ def ttfb_points(r: dict, kind: str) -> list[float]:
             continue
         if min(t.get("duration") or 0 for t in timings) < LOADED_MIN_TRANSFER_MS:
             continue
-        pts += [t["ttfb"] for t in (bucket.get("sideLatency") or []) if t.get("ttfb")]
+        pts += [t["ttfb"] for t in (bucket.get("sideLatency") or []) if t.get("ttfb") is not None]
     return pts[-LOADED_LATENCY_MAX_POINTS:]
 
 
@@ -165,9 +165,9 @@ def metrics_table(runs: list[dict]) -> str:
         ("Run", lambda r: r["name"]),
         ("Download (Mbps)", lambda r: num(r, "download", 1e6)),
         ("Upload (Mbps)",   lambda r: num(r, "upload", 1e6)),
-        ("TTFB idle (ms)",  lambda r: ttfb(r, "idle")),
-        ("TTFB ↓load (ms)", lambda r: ttfb(r, "download")),
-        ("TTFB ↑load (ms)", lambda r: ttfb(r, "upload")),
+        ("Latency idle (ms)",  lambda r: ttfb(r, "idle")),
+        ("Latency ↓load (ms)", lambda r: ttfb(r, "download")),
+        ("Latency ↑load (ms)", lambda r: ttfb(r, "upload")),
         ("Jitter (ms)",         lambda r: num(r, "jitter")),
     ]
     thead = "".join(f"<th>{html.escape(n)}</th>" for n, _ in cols)
@@ -216,7 +216,7 @@ def fig_latency_boxes(runs: list[dict]) -> go.Figure:
             ys.extend(vals)
         fig.add_box(name=r["name"], x=xs, y=ys, boxpoints="all", jitter=0.3)
     fig.update_layout(
-        title="TTFB (request to first response byte)", yaxis_title="ms",
+        title="Latency", yaxis_title="ms",
         boxmode="group",
         xaxis=dict(categoryorder="array", categoryarray=[b[0] for b in buckets]),
     )

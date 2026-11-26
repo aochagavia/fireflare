@@ -48,7 +48,40 @@ uv run main.py --debug        # tiny measurement set; for plumbing changes
 uv run main.py --headless     # no browser window (combinable with any of the above)
 ```
 
+Use `--firefox PATH` to run a local build instead of a downloaded one (e.g. `--firefox ../firefox/obj-x86_64-pc-linux-gnu/dist/bin/firefox`), and `--profile-dir DIR` to use a profile other than `./profile`.
+
 Output JSON files land in `results/`, named `<tag>-<utc-timestamp>.json`. The tag records, in order: `debug` (only with `--debug`); on `--vpn` runs `proxy-<v>` for the transport to the proxy (`h3` = QUIC with connect-udp negotiated to the proxy, `h2` = TCP CONNECT); and `origin-<v>` for the HTTP version negotiated with the origin, which reflects the destination tunnel method (`h2` = CONNECT, `h3` = connect-udp end to end).
+
+## Self-hosted server and proxy (`--bench`)
+
+`--bench` swaps speed.cloudflare.com and the IP-protection (Fastly) servers for [proxy-bench](../proxy-bench)'s `speedtest-server` and `connect-proxy`. IP protection still needs the signed-in profile (see the one-time setup above), because it still fetches a proxy pass from Mozilla before it connects. The pass is sent to the proxy, which ignores it.
+
+1. In a separate terminal, build proxy-bench and start both programs (Ctrl-C stops them). This assumes proxy-bench is checked out next to fireflare:
+
+   ```
+   cd ../proxy-bench && make && \
+     SERVER_ARGS="--alt-svc" \
+     PROXY_ARGS="--allow 127.0.0.1:8443 --allow [::1]:8443 --allow 127.0.0.1:8080" \
+     scripts/run-all.sh
+   ```
+
+   `--alt-svc` lets the h3 configurations discover HTTP/3. The proxy's `--allow` list keeps the default destinations (the speed test server on 8443), and adds the port the test page is served on (8080), because the page is loaded through the proxy too.
+
+2. Run fireflare, here with the full matrix and a local Firefox build:
+
+   ```
+   uv run main.py --bench --matrix --firefox ../firefox/obj-x86_64-pc-linux-gnu/dist/bin/firefox --profile-dir profile-local
+   ```
+
+   Every configuration works with `--bench`, alone or with `--matrix`, `--debug`, `--headless` and so on. Results go to `results-bench/`. Render them with `uv run report.py results-bench`.
+
+How it works:
+
+- The speed test server is addressed as `localhost4:8443` (`--bench-server`), and the test page is served at `http://localhost4:8080/` (`--bench-page-port`). `localhost4` is in the stock `/etc/hosts` and resolves to 127.0.0.1. IP protection never proxies loopback names or IPs (`localhost`, `*.localhost`, 127/8, `::1`), or any subresource of a page on one, so neither can use those.
+- The proxy is `localhost:4433` (`--bench-proxy`). It's configured through `browser.ipProtection.override.serverlist`, as MASQUE with a CONNECT fallback, or just CONNECT when HTTP/3 is disabled.
+- In bench mode, Alt-Svc is turned off for the non-h3 configurations, so they stay on TCP even though the server advertises HTTP/3.
+- The self-signed certificates are accepted through WebDriver's insecure-certs mode. `network.http.http3.disable_when_third_party_roots_found` is turned off, otherwise Firefox refuses HTTP/3 to them.
+- The origin's HTTP version comes from Resource Timing's `nextHopProtocol`, since the server has no `/cdn-cgi/trace`.
 
 ## License
 

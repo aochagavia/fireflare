@@ -19,6 +19,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -32,6 +33,7 @@ from facts import expected_facts, run_facts, short_name
 ROOT = Path(__file__).parent
 CACHE = ROOT / ".cache"
 RESULTS = ROOT / "results"
+RESULTS_BENCH = ROOT / "results-bench"
 PROFILE = ROOT / "profile"
 
 FIREFOX_NIGHTLY_URL = (
@@ -109,6 +111,54 @@ GECKODRIVER_LATEST_API = (
 SPEEDTEST_HTML = (ROOT / "speedtest.html").read_bytes()
 
 
+@dataclass(frozen=True)
+class Bench:
+    """A self-hosted speed test server + proxy (see ../proxy-bench) standing in
+    for speed.cloudflare.com and the IP-protection (Fastly) proxy.
+
+    IP protection never proxies a loopback destination, nor any subresource of
+    a page whose host is loopback (`localhost`, `*.localhost`, 127/8, ::1; see
+    IPPProxyableRuleProvider). `localhost4` is in the stock /etc/hosts, resolves
+    to 127.0.0.1, and is not on that list, so both the speed test server and
+    the page use it. The page is therefore reached through the proxy too, and
+    the proxy's allowlist must include the page port.
+    """
+    server: str   # host:port of the speed test server (HTTPS, h1/h2/h3)
+    proxy: str    # host:port of the CONNECT / CONNECT-UDP proxy
+    page_port: int
+
+    @property
+    def api(self) -> str:
+        return f"https://{self.server}"
+
+    @property
+    def page_host(self) -> str:
+        return self.server.rsplit(":", 1)[0]
+
+    def serverlist(self, *, h3: bool) -> str:
+        """IP protection server list (Remote Settings schema) holding just our
+        proxy, for browser.ipProtection.override.serverlist. The first protocol
+        is the primary proxyInfo and the rest are its failover chain. MASQUE
+        (HTTP/3: CONNECT for TCP, connect-udp for QUIC) is offered only when
+        HTTP/3 is enabled, otherwise the hop is a plain HTTP/2 CONNECT."""
+        host, port = self.proxy.rsplit(":", 1)
+        port = int(port)
+        protocols = [{"name": "connect", "host": host, "port": port,
+                      "scheme": "https"}]
+        if h3:
+            protocols.insert(0, {
+                "name": "masque", "host": host, "port": port,
+                "templateString":
+                    "/.well-known/masque/udp/{target_host}/{target_port}/",
+            })
+        return json.dumps([{
+            "name": "proxy-bench", "code": "REC",
+            "cities": [{"name": "local", "code": "local", "servers": [
+                {"hostname": host, "port": port, "protocols": protocols},
+            ]}],
+        }])
+
+
 def http_version_short(v: str | None) -> str:
     """Map a verbose HTTP version label ('HTTP/3', 'http/1.1', 'HTTP <= 1.1',
     …) to the compact tag form used in result filenames ('h3', 'h2', 'h1').
@@ -122,6 +172,11 @@ def http_version_short(v: str | None) -> str:
     if "1" in v:
         return "h1"
     return "?"
+
+
+def shown(path: Path) -> str:
+    """`path` relative to the repo when inside it, for console messages."""
+    return str(path.relative_to(ROOT)) if path.is_relative_to(ROOT) else str(path)
 
 
 def require_linux_x86_64() -> None:
@@ -241,7 +296,8 @@ def scrub_profile_test_stubs() -> None:
 
 def build_driver(firefox: Path, geckodriver: Path,
                  extra_prefs: dict | None = None,
-                 headless: bool = False) -> webdriver.Firefox:
+                 headless: bool = False,
+                 bench: Bench | None = None) -> webdriver.Firefox:
     options = Options()
     options.binary_location = str(firefox)
     # Headed by default so progress is visible during local development;
@@ -259,17 +315,25 @@ def build_driver(firefox: Path, geckodriver: Path,
     # that actually needs to talk to Mozilla services, including IP
     # protection. See remote/shared/RecommendedPreferences.sys.mjs.
     options.set_preference("remote.prefs.recommended", False)
-    # IP protection's channel filter excludes any request triggered from a
-    # loopback origin, which is exactly what our local test page is. Add
-    # an inclusion list so the Cloudflare speedtest endpoints are proxied
-    # anyway.
-    options.set_preference(
-        "browser.ipProtection.inclusion.match_patterns",
-        json.dumps([
-            "*://speed.cloudflare.com/*",
-            "*://bastion.h3.speed.cloudflare.com/*",
-        ]),
-    )
+    # --bench serves the page from a non-loopback name, so it needs no
+    # inclusions, and must not have any.
+    options.set_preference("browser.ipProtection.inclusion.match_patterns", "[]")
+    # Prefs set here persist in the profile, so always set the server list
+    # override: empty (= use the real Remote Settings list) unless --bench.
+    options.set_preference("browser.ipProtection.override.serverlist", "")
+    if bench:
+        # The proxy-bench certificates are self-signed (and name `localhost`,
+        # not `localhost4`). Marionette's insecure-certs mode skips verification
+        # browser-wide, for the proxy hop as well as the origin.
+        options.accept_insecure_certs = True
+        # Firefox refuses HTTP/3 (closes the QUIC connection after the
+        # handshake) to a server whose certificate chains to a root that isn't
+        # built in, which a self-signed or overridden one counts as.
+        options.set_preference(
+            "network.http.http3.disable_when_third_party_roots_found", False)
+        # The egress location picks a country from the server list; ours only
+        # has the recommended one.
+        options.set_preference("browser.ipProtection.egressLocation", "")
     # Caller-supplied prefs applied at launch (e.g. network.http.http3.enable),
     # so they take effect before any connection rather than mid-session.
     for key, value in (extra_prefs or {}).items():
@@ -292,6 +356,8 @@ class _PageHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(SPEEDTEST_HTML)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(SPEEDTEST_HTML)
 
@@ -299,11 +365,16 @@ class _PageHandler(BaseHTTPRequestHandler):
         pass
 
 
-def serve_page() -> tuple[ThreadingHTTPServer, str]:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _PageHandler)
+def serve_page(bench: Bench | None = None) -> tuple[ThreadingHTTPServer, str]:
+    if bench:
+        server = ThreadingHTTPServer(("127.0.0.1", bench.page_port), _PageHandler)
+        host = bench.page_host
+    else:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _PageHandler)
+        host = "127.0.0.1"
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
-    return server, f"http://127.0.0.1:{port}/"
+    return server, f"http://{host}:{port}/"
 
 
 def set_ip_protection(driver: webdriver.Firefox, enabled: bool) -> None:
@@ -339,7 +410,29 @@ def set_ip_protection(driver: webdriver.Firefox, enabled: bool) -> None:
                   },
                 };
                 Services.obs.addObserver(observer, 'http-on-stop-request');
-                IPPProxyManager.start(true, false).then(
+                // The proxy may already be up: IP protection restores its
+                // last state at startup. A second start() then re-initializes
+                // the live connection and fails ("Double initialization").
+                //
+                // It can also be up in a narrower mode (inclusion-only, from
+                // auto-activation), which would leave our traffic direct, so
+                // restart it then. isDefaultModeActive is undefined on older
+                // builds, which have no such modes.
+                const starting = (async () => {
+                  if (IPPProxyManager.state === 'activating') {
+                    // Joins the activation already in flight.
+                    await IPPProxyManager.start(true, false);
+                  }
+                  if (IPPProxyManager.state === 'active' &&
+                      IPPProxyManager.isDefaultModeActive === false) {
+                    await IPPProxyManager.stop();
+                  }
+                  if (IPPProxyManager.state === 'active') {
+                    return { started: true, alreadyActive: true };
+                  }
+                  return IPPProxyManager.start(true, false);
+                })();
+                starting.then(
                   r => {
                     Services.obs.removeObserver(observer, 'http-on-stop-request');
                     // Record proxyInfo from the first proxied channel during
@@ -364,8 +457,16 @@ def set_ip_protection(driver: webdriver.Firefox, enabled: bool) -> None:
                     };
                     Services.obs.addObserver(proxyObs, 'http-on-stop-request');
                     IPPProxyManager.__fireflare_obs = proxyObs;
+                    // start() reports failure as {started: false, error},
+                    // where error is a string code or a thrown Error, which
+                    // would serialize as {}.
+                    const res = { ...(r || {}) };
+                    if (res.error && typeof res.error !== 'string') {
+                      res.error = String(res.error) +
+                        (res.error.stack ? '\\n' + res.error.stack : '');
+                    }
                     done({
-                      result: r || {},
+                      result: res,
                       failed,
                       state: IPPProxyManager.state,
                       isActive: IPPProxyManager.isActive,
@@ -391,7 +492,8 @@ def set_ip_protection(driver: webdriver.Firefox, enabled: bool) -> None:
             if result.get("state") != "active":
                 sys.exit(
                     f"VPN start returned without error but proxy is not "
-                    f"active (state={result.get('state')!r})"
+                    f"active (state={result.get('state')!r}, "
+                    f"start() returned {result.get('result')!r})"
                 )
         else:
             driver.execute_async_script("""
@@ -443,18 +545,9 @@ def collect_proxy_info(driver: webdriver.Firefox) -> dict | None:
             // - h2 / h1 transport: the connection manager creates a wildcard
             //   `*:0` row for h2 coalescing; its httpVersion is the ALPN
             //   negotiated with the proxy (HTTP/2 or HTTP <= 1.1).
-            if (info.type === 'masque') {
-              dashboard.requestSockets(sockData => {
-                let httpVersion = null;
-                for (const s of (sockData.sockets || [])) {
-                  if (s.port === info.port && s.active && s.type === 'UDP') {
-                    httpVersion = 'HTTP/3';
-                    break;
-                  }
-                }
-                done({ ...info, httpVersion });
-              });
-            } else {
+            // A masque proxyInfo whose QUIC connection failed falls back to
+            // its CONNECT entry over TCP, so look for a TCP hop too.
+            const tcpHop = () => {
               dashboard.requestHttpConnections(httpData => {
                 let httpVersion = null;
                 for (const c of httpData.connections) {
@@ -465,6 +558,19 @@ def collect_proxy_info(driver: webdriver.Firefox) -> dict | None:
                 }
                 done({ ...info, httpVersion });
               });
+            };
+            if (info.type === 'masque') {
+              dashboard.requestSockets(sockData => {
+                for (const s of (sockData.sockets || [])) {
+                  if (s.port === info.port && s.active && s.type === 'UDP') {
+                    done({ ...info, httpVersion: 'HTTP/3' });
+                    return;
+                  }
+                }
+                tcpHop();
+              });
+            } else {
+              tcpHop();
             }
         """)
 
@@ -482,7 +588,8 @@ def disable_http_cache(driver: webdriver.Firefox) -> None:
         """)
 
 
-def prime_h3_altsvc(driver: webdriver.Firefox) -> None:
+def prime_h3_altsvc(driver: webdriver.Firefox, url: str = H3_PRIME_URL,
+                    page: bool = False) -> None:
     """Make the speedtest run over h3 to the origin through the MASQUE proxy.
 
     There is no HTTPS RR (DNS is resolved through the proxy), so the only h3
@@ -492,9 +599,21 @@ def prime_h3_altsvc(driver: webdriver.Firefox) -> None:
     mapping, then drop all connections and clear the h3-excluded list so the
     speedtest's own requests open fresh connections that take the h3
     (connect-udp) route from the now-stored mapping.
+
+    With `page`, `url` is our test page in its `prime` mode, which makes the
+    fetch itself (see speedtest.html), and we wait for it to say it's done.
     """
     print("Priming h3 Alt-Svc for the origin...")
-    driver.get(H3_PRIME_URL)
+    driver.get(url)
+    if page:
+        deadline = time.monotonic() + 30
+        while not driver.execute_script("return window.__fireflare_primed || null;"):
+            err = driver.execute_script("return window.__fireflare_error || null;")
+            if err:
+                sys.exit(f"h3 priming failed: {err}")
+            if time.monotonic() > deadline:
+                sys.exit("h3 priming did not complete within 30s")
+            time.sleep(0.2)
     time.sleep(2)
     with driver.context(driver.CONTEXT_CHROME):
         driver.execute_script("""
@@ -564,6 +683,8 @@ def save_result(result: dict, *, debug: bool, label: str | None = None) -> Path:
     parts = []
     if label:
         parts.append(label)
+    if result.get("bench"):
+        parts.append("bench")
     if debug:
         parts.append("debug")
     proxy = result.get("proxy")
@@ -573,14 +694,14 @@ def save_result(result: dict, *, debug: bool, label: str | None = None) -> Path:
     parts.append(ts)
     out_path = RESULTS / ("-".join(parts) + ".json")
     out_path.write_text(json.dumps(result, indent=2))
-    print(f"Saved {out_path.relative_to(ROOT)}")
+    print(f"Saved {shown(out_path)}")
     return out_path
 
 
 def run_once(firefox: Path, geckodriver: Path, base_url: str, *, vpn: bool,
              h3: bool, debug: bool, disable_h3: bool = False,
              label: str | None = None, profile: bool = False,
-             headless: bool = False) -> dict:
+             headless: bool = False, bench: Bench | None = None) -> dict:
     """Run a single speed test in its own Firefox session and save the result.
     Returns the result dict (with the negotiated proxy hop + origin protocol,
     so callers can confirm what actually happened at runtime)."""
@@ -598,15 +719,29 @@ def run_once(firefox: Path, geckodriver: Path, base_url: str, *, vpn: bool,
     qs.append(f"desc={urllib.parse.quote(expected)}")
     if label:
         qs.append(f"label={urllib.parse.quote(label)}")
+    if bench:
+        qs.append(f"api={urllib.parse.quote(bench.api)}")
     url = base_url + (f"?{'&'.join(qs)}" if qs else "")
     scrub_profile_test_stubs()
     # Set the h3 pref at launch (before any connection) so the proxy comes up on
     # the intended transport: h2 CONNECT when h3 is disabled, h3/connect-udp when
     # enabled. Set explicitly every run so a value persisted by a prior
     # disable_h3 run can't leak in.
-    driver = build_driver(firefox, geckodriver,
-                          extra_prefs={"network.http.http3.enable": not disable_h3},
-                          headless=headless)
+    prefs = {"network.http.http3.enable": not disable_h3}
+    if bench:
+        prefs["browser.ipProtection.override.serverlist"] = \
+            bench.serverlist(h3=not disable_h3)
+        # A self-hosted server advertises h3 on the same host the non-h3
+        # configs use (there's no separate h3-only endpoint), and the profile
+        # remembers Alt-Svc mappings across runs. So honor Alt-Svc only on runs
+        # meant to reach the origin over h3. This doesn't affect the hop to
+        # the proxy, which doesn't use Alt-Svc.
+        prefs["network.http.altsvc.enabled"] = h3
+    else:
+        # Prefs persist in the profile: undo a previous --bench run.
+        prefs["network.http.altsvc.enabled"] = True
+    driver = build_driver(firefox, geckodriver, extra_prefs=prefs,
+                          headless=headless, bench=bench)
     prof_tmp = None
     try:
         print(f"Expecting: {expected}")
@@ -618,7 +753,14 @@ def run_once(firefox: Path, geckodriver: Path, base_url: str, *, vpn: bool,
             disable_http_cache(driver)
         # For h3 over the VPN we must prime the origin's Alt-Svc and force fresh
         # connections, otherwise the speedtest reuses the initial h2 tunnel.
-        if vpn and h3:
+        if bench and h3:
+            # Our server has no HTTPS RR, so even a direct run only learns h3
+            # from Alt-Svc (the server must run with --alt-svc). Prime it the
+            # same way as through the VPN.
+            if not vpn:
+                disable_http_cache(driver)
+            prime_h3_altsvc(driver, url + "&prime=1", page=True)
+        elif vpn and h3:
             prime_h3_altsvc(driver)
         if profile:
             start_profiler(driver)
@@ -637,11 +779,13 @@ def run_once(firefox: Path, geckodriver: Path, base_url: str, *, vpn: bool,
         driver.quit()
     if label:
         result["config"] = label
+    if bench:
+        result["bench"] = {"server": bench.server, "proxy": bench.proxy}
     out_path = save_result(result, debug=debug, label=label)
     if prof_tmp and prof_tmp.exists():
         prof_path = out_path.with_name(out_path.stem + ".profile.json")
         shutil.move(str(prof_tmp), str(prof_path))
-        print(f"Saved {prof_path.relative_to(ROOT)}")
+        print(f"Saved {shown(prof_path)}")
     return result
 
 
@@ -660,8 +804,9 @@ MATRIX = [
 
 
 def run_matrix(firefox: Path, geckodriver: Path, *, debug: bool,
-               profile: bool = False, headless: bool = False) -> None:
-    server, base_url = serve_page()
+               profile: bool = False, headless: bool = False,
+               bench: Bench | None = None) -> None:
+    server, base_url = serve_page(bench)
     summary = []
     try:
         for i, (label, kwargs, skip_reason) in enumerate(MATRIX, start=1):
@@ -680,7 +825,7 @@ def run_matrix(firefox: Path, geckodriver: Path, *, debug: bool,
                 try:
                     result = run_once(firefox, geckodriver, base_url, debug=debug,
                                       label=label, profile=profile,
-                                      headless=headless, **kwargs)
+                                      headless=headless, bench=bench, **kwargs)
                     break
                 except SystemExit as e:
                     print(f"FAILED {label} (attempt {attempt}/3): {e}")
@@ -701,6 +846,7 @@ def run_matrix(firefox: Path, geckodriver: Path, *, debug: bool,
 
 
 def main() -> None:
+    global PROFILE, RESULTS
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--h3", action="store_true",
@@ -738,28 +884,78 @@ def main() -> None:
         help="run Firefox without a window (for machines without a display, "
              "e.g. a server over SSH)",
     )
+    parser.add_argument(
+        "--firefox", type=Path, metavar="PATH",
+        help="use this Firefox binary (e.g. a local build's "
+             "obj-*/dist/bin/firefox) instead of downloading one",
+    )
+    parser.add_argument(
+        "--profile-dir", type=Path, metavar="DIR", default=PROFILE,
+        help="persistent Firefox profile to use (default: ./profile). Must be "
+             "signed in for --vpn, see the README",
+    )
+    parser.add_argument(
+        "--results-dir", type=Path, metavar="DIR",
+        help="where to save result JSONs (default: ./results, or "
+             "./results-bench with --bench, so the two never mix in a report)",
+    )
+    parser.add_argument(
+        "--bench", action="store_true",
+        help="use a self-hosted speed test server and proxy (../proxy-bench) "
+             "instead of speed.cloudflare.com and the IP-protection servers",
+    )
+    parser.add_argument(
+        "--bench-server", default="localhost4:8443", metavar="HOST:PORT",
+        help="speed test server for --bench (default: %(default)s). The host "
+             "must resolve to the server but not be a loopback name or IP, "
+             "which IP protection never proxies",
+    )
+    parser.add_argument(
+        "--bench-proxy", default="localhost:4433", metavar="HOST:PORT",
+        help="proxy for --bench (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--bench-page-port", type=int, default=8080, metavar="PORT",
+        help="port the test page is served on for --bench (default: "
+             "%(default)s). The page goes through the proxy, so the proxy must "
+             "allow 127.0.0.1:PORT",
+    )
     args = parser.parse_args()
 
     require_linux_x86_64()
+    PROFILE = args.profile_dir.resolve()
+    RESULTS = (args.results_dir or (RESULTS_BENCH if args.bench else RESULTS)).resolve()
     CACHE.mkdir(exist_ok=True)
     RESULTS.mkdir(exist_ok=True)
     PROFILE.mkdir(exist_ok=True)
 
-    # The matrix always uses the custom build (configs 4/5 need it).
-    use_custom = args.custom_firefox or args.matrix
-    firefox = ensure_firefox(FIREFOX_CUSTOM_URL if use_custom else FIREFOX_NIGHTLY_URL)
+    bench = None
+    if args.bench:
+        bench = Bench(server=args.bench_server, proxy=args.bench_proxy,
+                      page_port=args.bench_page_port)
+
+    if args.firefox:
+        firefox = args.firefox.resolve()
+        if not firefox.is_file():
+            sys.exit(f"--firefox {firefox} not found")
+    else:
+        # The matrix always uses the custom build (configs 4/5 need it).
+        use_custom = args.custom_firefox or args.matrix
+        firefox = ensure_firefox(
+            FIREFOX_CUSTOM_URL if use_custom else FIREFOX_NIGHTLY_URL)
     geckodriver = ensure_geckodriver()
     print(f"Using {firefox_version(firefox)}")
 
     if args.matrix:
         run_matrix(firefox, geckodriver, debug=args.debug, profile=args.profile,
-                   headless=args.headless)
+                   headless=args.headless, bench=bench)
         return
 
-    server, base_url = serve_page()
+    server, base_url = serve_page(bench)
     try:
         run_once(firefox, geckodriver, base_url, vpn=args.vpn, h3=args.h3,
-                 debug=args.debug, profile=args.profile, headless=args.headless)
+                 debug=args.debug, profile=args.profile, headless=args.headless,
+                 bench=bench)
     finally:
         server.shutdown()
 

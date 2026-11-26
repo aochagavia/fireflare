@@ -5,15 +5,36 @@
 <p id="detail"></p>
 <pre id="log">running @cloudflare/speedtest...</pre>
 <script type="module">
-import SpeedTest from 'https://esm.sh/@cloudflare/speedtest';
+const params = new URLSearchParams(location.search);
+const h3 = params.has('h3');
+const debugMode = params.has('debug');
+// `api` (e.g. https://localhost4:8443) points the run at a self-hosted stand-in
+// for speed.cloudflare.com (proxy-bench), which also serves the library from
+// its --docroot.
+const benchApi = params.get('api');
+const apiBase = benchApi ||
+  (h3 ? 'https://bastion.h3.speed.cloudflare.com' : 'https://speed.cloudflare.com');
+
+// `prime`: fetch the server once so Firefox stores its h3 Alt-Svc, then stop
+// (see prime_h3_altsvc in main.py). Done here rather than by navigating to the
+// server, whose responses are downloads.
+if (params.has('prime')) {
+  try {
+    await fetch(`${apiBase}/__down?bytes=0&prime=${Date.now()}`);
+    window.__fireflare_primed = true;
+  } catch (e) {
+    window.__fireflare_error = 'prime: ' + String((e && e.message) || e);
+  }
+  await new Promise(() => {});  // never resolves: stop the module here
+}
+
+const { default: SpeedTest } = await import(
+  benchApi ? `${benchApi}/speedtest.js` : 'https://esm.sh/@cloudflare/speedtest');
 const log = document.getElementById('log');
 // Based on @cloudflare/speedtest's defaultConfig. Packet-loss entry dropped
 // (needs a TURN server). Counts roughly doubled for a tighter distribution
 // per bucket, ~2× total runtime.
 // Source: cloudflare/speedtest src/config/defaultConfig.js
-const params = new URLSearchParams(location.search);
-const h3 = params.has('h3');
-const debugMode = params.has('debug');
 // During a --matrix run each config gets its own Firefox session, so without
 // this the window gives no clue which of the five is in flight. `desc` is the
 // path this run is expected to take, phrased by facts.py the same way the
@@ -27,7 +48,7 @@ const detail = [];
 if (desc) detail.push('expected path, confirmed from the result once it lands');
 if (label) detail.push('config ' + label);
 detail.push((debugMode ? 'debug subset' : 'full set') + ' of measurements');
-detail.push('endpoint ' + (h3 ? 'bastion.h3.speed.cloudflare.com' : 'speed.cloudflare.com'));
+detail.push('endpoint ' + new URL(apiBase).host);
 document.getElementById('detail').textContent = detail.join(' · ');
 // The measurements take a couple of minutes with no output of their own, so
 // tick an elapsed counter to show the run is alive, and name the measurement
@@ -46,17 +67,25 @@ const ticker = setInterval(() => {
   }
   log.textContent = lines.join('\n');
 }, 1000);
-const apiBase = h3 ? 'https://bastion.h3.speed.cloudflare.com' : 'https://speed.cloudflare.com';
-const endpointOverrides = h3 ? {
+const endpointOverrides = {
   downloadApiUrl: apiBase + '/__down',
   uploadApiUrl:   apiBase + '/__up',
-} : {};
+  ...(benchApi ? { logAimApiUrl: apiBase + '/__results' } : {}),
+};
 
 async function fetchTrace() {
-  // cdn-cgi/trace returns plain text, one `key=value` per line. Gives us
-  // client IP (as seen by Cloudflare), colo (edge PoP), country, HTTP
-  // version, TLS version, SNI, context a MASQUE comparison needs.
   try {
+    if (benchApi) {
+      // No cdn-cgi/trace here, so take the HTTP version a last zero-byte
+      // request negotiated from Resource Timing ('h3', 'h2', 'http/1.1'). This
+      // needs the server's Timing-Allow-Origin, as the request is cross-origin.
+      const url = `${apiBase}/__down?bytes=0&trace=${Date.now()}`;
+      await (await fetch(url)).arrayBuffer();
+      return { http: performance.getEntriesByName(url).pop()?.nextHopProtocol };
+    }
+    // cdn-cgi/trace returns plain text, one `key=value` per line. Gives us
+    // client IP (as seen by Cloudflare), colo (edge PoP), country, HTTP
+    // version, TLS version, SNI, context a MASQUE comparison needs.
     const r = await fetch(apiBase + '/cdn-cgi/trace');
     const txt = await r.text();
     return Object.fromEntries(

@@ -1,6 +1,7 @@
 """Render an HTML report from the JSON runs in results/.
 
-Usage: `uv run report.py` → writes `results/report.html`.
+Usage: `uv run report.py [DIR]` → writes `DIR/report.html` (DIR defaults to
+`results/`; `main.py --bench` runs land in `results-bench/`).
 
 Layout: one explained section per run (what the run actually did, across the
 three connection dimensions), then a compact metrics table, then the graphs.
@@ -8,6 +9,7 @@ three connection dimensions), then a compact metrics table, then the graphs.
 
 from __future__ import annotations
 
+import argparse
 import html
 import json
 import statistics
@@ -20,7 +22,6 @@ from facts import pretty_http, run_facts, short_name
 
 ROOT = Path(__file__).parent
 RESULTS = ROOT / "results"
-REPORT = RESULTS / "report.html"
 
 
 def pretty_ts(ts: str) -> str:
@@ -32,9 +33,9 @@ def pretty_ts(ts: str) -> str:
         return ts or "-"
 
 
-def load_runs() -> list[dict]:
+def load_runs(results: Path) -> list[dict]:
     runs = []
-    for p in sorted(RESULTS.glob("*.json")):
+    for p in sorted(results.glob("*.json")):
         if p.name.endswith(".profile.json"):
             continue  # Gecko profiler capture, not a speed-test result
         r = {"file": p.name, "ts": p.stem.rpartition("-")[2],
@@ -248,9 +249,13 @@ code { background: #eef; padding: 0 .25em; border-radius: 3px; }
 
 
 def main() -> None:
-    runs = load_runs()
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("results", nargs="?", type=Path, default=RESULTS,
+                        help="directory of JSON runs (default: results/)")
+    results = parser.parse_args().results
+    runs = load_runs(results)
     if not runs:
-        raise SystemExit("no JSON runs in results/")
+        raise SystemExit(f"no JSON runs in {results}/")
 
     figs = [
         fig_bandwidth_boxes(runs, "downloadBandwidthPoints", "Download by transfer size"),
@@ -291,8 +296,9 @@ def main() -> None:
         + "".join(graphs)
         + "</body></html>"
     )
-    REPORT.write_text(html_out)
-    print(f"wrote {REPORT.relative_to(ROOT)}")
+    report = results / "report.html"
+    report.write_text(html_out)
+    print(f"wrote {report}")
 
 
 if __name__ == "__main__":

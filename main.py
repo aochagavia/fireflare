@@ -240,10 +240,14 @@ def scrub_profile_test_stubs() -> None:
 
 
 def build_driver(firefox: Path, geckodriver: Path,
-                 extra_prefs: dict | None = None) -> webdriver.Firefox:
+                 extra_prefs: dict | None = None,
+                 headless: bool = False) -> webdriver.Firefox:
     options = Options()
     options.binary_location = str(firefox)
-    # Headed so progress is visible during local development. Flip for CI.
+    # Headed by default so progress is visible during local development;
+    # `--headless` for machines without a display (e.g. a server over SSH).
+    if headless:
+        options.add_argument("-headless")
     # Persist the Firefox profile under ./profile/ so state (prefs, caches,
     # any MASQUE config) carries across runs instead of being wiped with the
     # default throwaway profile.
@@ -575,7 +579,8 @@ def save_result(result: dict, *, debug: bool, label: str | None = None) -> Path:
 
 def run_once(firefox: Path, geckodriver: Path, base_url: str, *, vpn: bool,
              h3: bool, debug: bool, disable_h3: bool = False,
-             label: str | None = None, profile: bool = False) -> dict:
+             label: str | None = None, profile: bool = False,
+             headless: bool = False) -> dict:
     """Run a single speed test in its own Firefox session and save the result.
     Returns the result dict (with the negotiated proxy hop + origin protocol,
     so callers can confirm what actually happened at runtime)."""
@@ -600,7 +605,8 @@ def run_once(firefox: Path, geckodriver: Path, base_url: str, *, vpn: bool,
     # enabled. Set explicitly every run so a value persisted by a prior
     # disable_h3 run can't leak in.
     driver = build_driver(firefox, geckodriver,
-                          extra_prefs={"network.http.http3.enable": not disable_h3})
+                          extra_prefs={"network.http.http3.enable": not disable_h3},
+                          headless=headless)
     prof_tmp = None
     try:
         print(f"Expecting: {expected}")
@@ -654,7 +660,7 @@ MATRIX = [
 
 
 def run_matrix(firefox: Path, geckodriver: Path, *, debug: bool,
-               profile: bool = False) -> None:
+               profile: bool = False, headless: bool = False) -> None:
     server, base_url = serve_page()
     summary = []
     try:
@@ -673,7 +679,8 @@ def run_matrix(firefox: Path, geckodriver: Path, *, debug: bool,
             for attempt in range(1, 4):
                 try:
                     result = run_once(firefox, geckodriver, base_url, debug=debug,
-                                      label=label, profile=profile, **kwargs)
+                                      label=label, profile=profile,
+                                      headless=headless, **kwargs)
                     break
                 except SystemExit as e:
                     print(f"FAILED {label} (attempt {attempt}/3): {e}")
@@ -726,6 +733,11 @@ def main() -> None:
              "each run, saved next to the result as <name>.profile.json "
              "(load at profiler.firefox.com)",
     )
+    parser.add_argument(
+        "--headless", action="store_true",
+        help="run Firefox without a window (for machines without a display, "
+             "e.g. a server over SSH)",
+    )
     args = parser.parse_args()
 
     require_linux_x86_64()
@@ -740,13 +752,14 @@ def main() -> None:
     print(f"Using {firefox_version(firefox)}")
 
     if args.matrix:
-        run_matrix(firefox, geckodriver, debug=args.debug, profile=args.profile)
+        run_matrix(firefox, geckodriver, debug=args.debug, profile=args.profile,
+                   headless=args.headless)
         return
 
     server, base_url = serve_page()
     try:
         run_once(firefox, geckodriver, base_url, vpn=args.vpn, h3=args.h3,
-                 debug=args.debug, profile=args.profile)
+                 debug=args.debug, profile=args.profile, headless=args.headless)
     finally:
         server.shutdown()
 

@@ -45,6 +45,7 @@ uv run main.py --vpn --h3 --custom-firefox   # end-to-end HTTP/3 over MASQUE (tr
 uv run main.py --matrix       # all five comparison paths, one result JSON each
 uv run main.py --matrix --profile   # also capture a Firefox Profiler "Networking" profile per run
 uv run main.py --debug        # tiny measurement set; for plumbing changes
+uv run main.py --headless     # no browser window (combinable with any of the above)
 ```
 
 Output JSON files land in `results/`, named `<tag>-<utc-timestamp>.json`. The tag records, in order: `debug` (only with `--debug`); on `--vpn` runs `proxy-<v>` for the transport to the proxy (`h3` = QUIC with connect-udp negotiated to the proxy, `h2` = TCP CONNECT); and `origin-<v>` for the HTTP version negotiated with the origin, which reflects the destination tunnel method (`h2` = CONNECT, `h3` = connect-udp end to end).
